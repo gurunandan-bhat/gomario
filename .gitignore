@@ -1,0 +1,7 @@
+.DS_Store
+node_modules/
+tmp/
+main
+gomario
+assets/js/bundle.js
+assets/js/bundle.js.map
