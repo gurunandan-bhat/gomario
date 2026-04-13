@@ -42,6 +42,11 @@ type Config struct {
 		Password string `mapstructure:"password"`
 		From     string `mapstructure:"from"`
 	} `mapstructure:"smtp"`
+	Telemetry struct {
+		Enabled     bool   `mapstructure:"enabled"`
+		ServiceName string `mapstructure:"serviceName"`
+		Endpoint    string `mapstructure:"endpoint"` // OTLP HTTP endpoint, e.g. "http://localhost:4318"
+	} `mapstructure:"telemetry"`
 	Cognito struct {
 		Region       string `mapstructure:"region"`
 		UserPoolID   string `mapstructure:"userPoolId"`

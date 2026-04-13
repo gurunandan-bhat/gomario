@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"gomario/lib/config"
 	"gomario/lib/service"
+	"gomario/lib/telemetry"
 	"log"
 	"log/slog"
 	"net/http"
@@ -29,15 +30,23 @@ func main() {
 		log.Fatalf("Error reading application configuration: %s", err)
 	}
 
-	service, err := service.NewService(cfg)
+	// Initialise OpenTelemetry. The shutdown function flushes all pending
+	// spans and metrics — it must be called before the process exits.
+	ctx := context.Background()
+	telShutdown, err := telemetry.Setup(ctx, cfg)
+	if err != nil {
+		log.Fatalf("Error initialising telemetry: %s", err)
+	}
+
+	svc, err := service.NewService(cfg)
 	if err != nil {
 		log.Fatalf("Error creating new service: %s", err)
 	}
 
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.HttpHost, cfg.HttpPort),
-		Handler:      service.Muxer,
-		ErrorLog:     slog.NewLogLogger(service.Logger.Handler(), slog.LevelWarn),
+		Handler:      svc.Handler, // otelhttp-wrapped mux
+		ErrorLog:     slog.NewLogLogger(svc.Logger.Handler(), slog.LevelWarn),
 		IdleTimeout:  defaultIdleTimeout,
 		ReadTimeout:  defaultReadTimeout,
 		WriteTimeout: defaultWriteTimeout,
@@ -53,14 +62,19 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultShutdownPeriod)
 		defer cancel()
 
-		shutdownErrorChan <- httpServer.Shutdown(ctx)
+		// Shut down HTTP server first, then flush telemetry.
+		if err := httpServer.Shutdown(ctx); err != nil {
+			shutdownErrorChan <- err
+			return
+		}
+		shutdownErrorChan <- telShutdown(ctx)
 	}()
 
-	service.Logger.Info("starting server", slog.Group("server", "addr", httpServer.Addr))
+	svc.Logger.Info("starting server", slog.Group("server", "addr", httpServer.Addr))
 
 	if err := httpServer.ListenAndServe(); err != nil {
 		if !errors.Is(err, http.ErrServerClosed) {
-			service.Logger.Error("server error", "error", err)
+			svc.Logger.Error("server error", "error", err)
 			os.Exit(1)
 		}
 	}
@@ -70,5 +84,5 @@ func main() {
 		log.Fatalf("error shutting down server: %v", err)
 	}
 
-	service.Logger.Info("stopped server", slog.Group("server", "addr", httpServer.Addr))
+	svc.Logger.Info("stopped server", slog.Group("server", "addr", httpServer.Addr))
 }

@@ -242,3 +242,58 @@ Now references only `bundle.js`:
 npm install   # installs esbuild and other devDependencies
 make build    # produces bundle.js and ./tmp/gomario
 ```
+
+---
+
+# Telemetry — OpenTelemetry
+
+## Design
+
+Vendor-neutral OpenTelemetry integration covering traces, metrics, and health probes. All signals export via OTLP HTTP to any compatible collector (AWS ADOT, Grafana Agent, local `otel-collector`). The backend can be swapped without touching app code.
+
+| Signal | Mechanism |
+|--------|-----------|
+| **Traces** | `otelhttp.NewHandler` wraps the chi mux — every request gets a span. DB queries get child spans via `otelsql`. |
+| **Metrics** | HTTP metrics (count, duration, errors) via `otelhttp`. DB pool stats (open, in-use, idle) as observable gauges. |
+| **Health** | `GET /healthz` (liveness), `GET /readyz` (readiness + DB ping). No auth required. |
+
+In development (`IsProduction: false`) spans are also written to stdout so traces are visible without a running collector.
+
+## Config (`~/.gomario.json`)
+
+```json
+"telemetry": {
+  "enabled": true,
+  "serviceName": "gomario",
+  "endpoint": "http://localhost:4318"
+}
+```
+
+## What Was Implemented
+
+### `lib/telemetry/telemetry.go` + `resource.go` *(new)*
+`Setup(ctx, cfg)` initialises the OTel trace and metric providers and sets them as globals. Returns a `shutdown` function that flushes both providers — called during graceful shutdown in `main.go`.
+
+### `lib/model/model.go`
+MySQL driver opened via `otelsql.Open` (github.com/XSAM/otelsql) instead of directly. Every SQL query now produces a child span with query text and duration.
+
+### `lib/service/health.go` *(new)*
+- `GET /healthz` — always 200 `{"status":"ok"}` (liveness)
+- `GET /readyz` — pings DB; 200 or 503 `{"status":"unavailable"}` (readiness)
+
+### `lib/service/service.go`
+- `Service.Handler http.Handler` field added — the otelhttp-wrapped mux. **Use `svc.Handler` (not `svc.Muxer`) as the `http.Server` handler.**
+- `registerDBPoolMetrics()` registers observable gauges for `db.pool.open_connections`, `db.pool.in_use`, `db.pool.idle`.
+- `/healthz` and `/readyz` routes registered (no auth middleware).
+
+### `main.go`
+- `telemetry.Setup(ctx, cfg)` called before `NewService`.
+- Telemetry shutdown wired into the graceful shutdown goroutine (after HTTP server closes, before process exits).
+- `httpServer.Handler` now uses `svc.Handler` instead of `svc.Muxer`.
+
+## Verification
+1. `go build ./...` — no compile errors
+2. `GET /healthz` → `{"status":"ok"}` with no auth
+3. `GET /readyz` → `{"status":"ok"}` when DB is up, `503` when down
+4. Dev mode: spans printed to stdout for each request, with DB child spans visible
+5. With a local collector (`otelcol --config=...`): traces appear at the OTLP endpoint

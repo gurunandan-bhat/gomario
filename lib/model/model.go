@@ -6,8 +6,10 @@ import (
 	"log"
 	"time"
 
+	"github.com/XSAM/otelsql"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 type Model struct {
@@ -40,17 +42,24 @@ func NewModel(cfg *config.Config) (*Model, error) {
 	dbCfg.Loc = tz
 	dbCfg.AllowNativePasswords = cfg.Db.AllowNativePasswords
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	dbHandle, err := sqlx.ConnectContext(ctx, "mysql", dbCfg.FormatDSN())
+	// Open the database through the otelsql wrapper so every query produces
+	// an OpenTelemetry child span automatically.
+	sqlDB, err := otelsql.Open("mysql", dbCfg.FormatDSN(),
+		otelsql.WithAttributes(semconv.DBSystemMySQL),
+		otelsql.WithSpanOptions(otelsql.SpanOptions{Ping: true}),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := dbHandle.Ping(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	if err := sqlDB.PingContext(ctx); err != nil {
 		return nil, err
 	}
+
+	dbHandle := sqlx.NewDb(sqlDB, "mysql")
 
 	dbHandle.SetMaxOpenConns(maxOpenConns)
 	dbHandle.SetMaxIdleConns(maxIdleConns)

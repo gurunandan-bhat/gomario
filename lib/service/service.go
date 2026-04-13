@@ -19,11 +19,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 )
 
 type Service struct {
 	Config         *config.Config
-	Muxer          *chi.Mux
+	Handler        http.Handler
 	Template       map[string]*template.Template
 	SessionManager *scs.SessionManager
 	Model          *model.Model
@@ -89,7 +92,6 @@ func NewService(cfg *config.Config) (*Service, error) {
 
 	s := &Service{
 		Config:         cfg,
-		Muxer:          mux,
 		Template:       template,
 		SessionManager: sessionMgr,
 		Model:          m,
@@ -97,24 +99,68 @@ func NewService(cfg *config.Config) (*Service, error) {
 		JWKSCache:      jwksCache,
 	}
 
-	s.setRoutes()
+	s.setRoutes(mux)
+
+	// Wrap the router with OTel HTTP instrumentation. Every request gets a span
+	// automatically. s.Handler is what main.go hands to http.Server.
+	s.Handler = otelhttp.NewHandler(mux, cfg.Telemetry.ServiceName)
+
+	// Register DB connection pool stats as observable gauges.
+	if err := s.registerDBPoolMetrics(); err != nil {
+		log.Fatalf("Cannot register DB pool metrics: %s", err)
+	}
 
 	return s, nil
 }
 
-func (s *Service) setRoutes() {
+// registerDBPoolMetrics registers observable gauges that report sqlx connection
+// pool statistics on each metrics collection interval.
+func (s *Service) registerDBPoolMetrics() error {
+	meter := otel.Meter(s.Config.Telemetry.ServiceName)
 
-	s.Muxer.Method(http.MethodGet, "/", serviceHandler(s.index))
-	s.Muxer.Method(http.MethodGet, "/start", serviceHandler(s.start))
+	openConns, err := meter.Int64ObservableGauge("db.pool.open_connections",
+		metric.WithDescription("Number of open DB connections (in-use + idle)"))
+	if err != nil {
+		return err
+	}
+	inUse, err := meter.Int64ObservableGauge("db.pool.in_use",
+		metric.WithDescription("Number of DB connections currently in use"))
+	if err != nil {
+		return err
+	}
+	idle, err := meter.Int64ObservableGauge("db.pool.idle",
+		metric.WithDescription("Number of idle DB connections"))
+	if err != nil {
+		return err
+	}
+
+	_, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		stats := s.Model.DbHandle.Stats()
+		o.ObserveInt64(openConns, int64(stats.OpenConnections))
+		o.ObserveInt64(inUse, int64(stats.InUse))
+		o.ObserveInt64(idle, int64(stats.Idle))
+		return nil
+	}, openConns, inUse, idle)
+	return err
+}
+
+func (s *Service) setRoutes(mux *chi.Mux) {
+
+	// Health probes — no auth, no CSRF.
+	mux.Method(http.MethodGet, "/healthz", apiHandler(s.healthz))
+	mux.Method(http.MethodGet, "/readyz", apiHandler(s.readyz))
+
+	mux.Method(http.MethodGet, "/", serviceHandler(s.index))
+	mux.Method(http.MethodGet, "/start", serviceHandler(s.start))
 
 	// Auth routes — not protected by requireAuth.
-	s.Muxer.Method(http.MethodGet, "/login", serviceHandler(s.login))
-	s.Muxer.Method(http.MethodGet, "/auth/callback", serviceHandler(s.authCallback))
-	s.Muxer.Method(http.MethodGet, "/logout", serviceHandler(s.logout))
+	mux.Method(http.MethodGet, "/login", serviceHandler(s.login))
+	mux.Method(http.MethodGet, "/auth/callback", serviceHandler(s.authCallback))
+	mux.Method(http.MethodGet, "/logout", serviceHandler(s.logout))
 
 	// JSON API routes — all require authentication; group-restricted routes
 	// use r.With(s.apiRequireGroup("group-name")) per endpoint.
-	s.Muxer.Route("/api", func(r chi.Router) {
+	mux.Route("/api", func(r chi.Router) {
 		r.Use(s.apiAuthMiddleware)
 
 		// Returns the current CSRF token so JavaScript can include it as
