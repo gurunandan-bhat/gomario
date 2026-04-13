@@ -60,13 +60,13 @@ func (s *Service) render(w http.ResponseWriter, template string, data any, heade
 		return fmt.Errorf("error executing template %s: %w", template, err)
 	}
 
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	for key, values := range headers {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
 	w.WriteHeader(status)
-	w.Header().Add("Content-Type", "text/html")
 
 	if _, err := w.Write(b.Bytes()); err != nil {
 		return fmt.Errorf("error rendering %s: %w", template, err)

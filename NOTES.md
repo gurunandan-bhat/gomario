@@ -297,3 +297,74 @@ MySQL driver opened via `otelsql.Open` (github.com/XSAM/otelsql) instead of dire
 3. `GET /readyz` → `{"status":"ok"}` when DB is up, `503` when down
 4. Dev mode: spans printed to stdout for each request, with DB child spans visible
 5. With a local collector (`otelcol --config=...`): traces appear at the OTLP endpoint
+
+---
+
+# Error Handling
+
+## Design
+
+Structured error handling with typed errors, custom error pages, and OTel integration. Should have been implemented first — every feature now built on top benefits automatically.
+
+### `HTTPError` — typed errors
+Handlers return an `HTTPError` to control the response status and user-facing message. Anything else is treated as an unexpected 500.
+
+```go
+return service.ErrNotFound("that page doesn't exist")   // → 404 page
+return service.ErrForbidden("access denied")             // → 403 page
+return fmt.Errorf("db query failed: %w", err)            // → 500 page (logged)
+```
+
+### Handler wrappers
+`s.handle(fn)` for HTML routes, `s.handleAPI(fn)` for JSON API routes. Both close over `*Service` so the error path can log, record OTel spans, and render templates.
+
+### Error page selection
+- `HTTPError` with status < 500 → `4xx.go.html`
+- `HTTPError` with status ≥ 500, or any unexpected error → `5xx.go.html`
+- If the error template itself fails → plain text fallback
+
+## What Was Implemented
+
+### `lib/service/errors.go` *(new)*
+`HTTPError` struct + constructors: `ErrBadRequest`, `ErrUnauthorized`, `ErrForbidden`, `ErrNotFound`, `ErrMethodNotAllowed`.
+
+### `lib/service/handler.go`
+- Removed `serviceHandler` type
+- `s.handle(fn)` — wraps HTML route handlers; errors call `s.handleHTTPError`
+- `s.handleHTTPError(w, r, err)` — records on OTel span, logs 5xx, renders error template
+- `s.renderErrorPage(w, status, message)` — picks `4xx.go.html` or `5xx.go.html`
+
+### `lib/service/apihandler.go`
+- Removed `apiHandler` type
+- `s.handleAPI(fn)` — wraps JSON API handlers; errors call `s.handleAPIError`
+- `s.handleAPIError(w, r, err)` — records on OTel span, logs 5xx, writes JSON error body
+
+### `lib/service/middleware.go`
+- Removed `Middleware` type (wrapped the old `serviceHandler`)
+- `requireAuth` converted to `func(http.Handler) http.Handler` — uniform with API middleware
+- `requireGroup` converted to `func(string) func(http.Handler) http.Handler`
+- `apiAuthMiddleware` and `apiRequireGroup` now use `s.handleAPIError` for consistent JSON error responses
+
+### `lib/service/service.go`
+- `mux.NotFound` → renders `4xx.go.html` with 404
+- `mux.MethodNotAllowed` → renders `4xx.go.html` with 405
+- All route registrations updated: `serviceHandler(s.x)` → `s.handle(s.x)`, `apiHandler(s.x)` → `s.handleAPI(s.x)`
+
+### `lib/service/render.go`
+Fixed bug: `Content-Type: text/html; charset=utf-8` now set *before* `WriteHeader` so it is actually sent to the client.
+
+## Usage
+
+```go
+// Signal a specific HTTP status from any handler:
+return service.ErrNotFound("the item you requested does not exist")
+
+// Protect an HTML route group:
+mux.Group(func(r chi.Router) {
+    r.Use(s.requireAuth)
+    r.Method(http.MethodGet, "/dashboard", s.handle(s.dashboard))
+})
+
+// Protect an HTML route with group membership:
+mux.With(s.requireGroup("admin")).Method(http.MethodGet, "/admin", s.handle(s.admin))
+```

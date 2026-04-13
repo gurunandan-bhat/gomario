@@ -146,17 +146,25 @@ func (s *Service) registerDBPoolMetrics() error {
 
 func (s *Service) setRoutes(mux *chi.Mux) {
 
-	// Health probes — no auth, no CSRF.
-	mux.Method(http.MethodGet, "/healthz", apiHandler(s.healthz))
-	mux.Method(http.MethodGet, "/readyz", apiHandler(s.readyz))
+	// Custom 404 and 405 — renders 4xx.go.html instead of chi's plain text.
+	mux.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		s.renderErrorPage(w, http.StatusNotFound, "The page you're looking for doesn't exist.")
+	})
+	mux.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		s.renderErrorPage(w, http.StatusMethodNotAllowed, "Method not allowed.")
+	})
 
-	mux.Method(http.MethodGet, "/", serviceHandler(s.index))
-	mux.Method(http.MethodGet, "/start", serviceHandler(s.start))
+	// Health probes — no auth, no CSRF.
+	mux.Method(http.MethodGet, "/healthz", s.handleAPI(s.healthz))
+	mux.Method(http.MethodGet, "/readyz", s.handleAPI(s.readyz))
+
+	mux.Method(http.MethodGet, "/", s.handle(s.index))
+	mux.Method(http.MethodGet, "/start", s.handle(s.start))
 
 	// Auth routes — not protected by requireAuth.
-	mux.Method(http.MethodGet, "/login", serviceHandler(s.login))
-	mux.Method(http.MethodGet, "/auth/callback", serviceHandler(s.authCallback))
-	mux.Method(http.MethodGet, "/logout", serviceHandler(s.logout))
+	mux.Method(http.MethodGet, "/login", s.handle(s.login))
+	mux.Method(http.MethodGet, "/auth/callback", s.handle(s.authCallback))
+	mux.Method(http.MethodGet, "/logout", s.handle(s.logout))
 
 	// JSON API routes — all require authentication; group-restricted routes
 	// use r.With(s.apiRequireGroup("group-name")) per endpoint.
@@ -165,7 +173,7 @@ func (s *Service) setRoutes(mux *chi.Mux) {
 
 		// Returns the current CSRF token so JavaScript can include it as
 		// X-CSRF-Token on state-mutating requests (POST/PUT/DELETE).
-		r.Method(http.MethodGet, "/csrf-token", apiHandler(s.csrfToken))
+		r.Method(http.MethodGet, "/csrf-token", s.handleAPI(s.csrfToken))
 	})
 }
 
