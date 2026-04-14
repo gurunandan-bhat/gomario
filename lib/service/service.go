@@ -67,7 +67,9 @@ func NewService(cfg *config.Config) (*Service, error) {
 	sessionMgr.Lifetime = 12 * time.Hour
 	sessionMgr.Cookie.Name = cfg.Session.CookieName
 	sessionMgr.Cookie.HttpOnly = true
-	sessionMgr.Cookie.SameSite = http.SameSiteStrictMode
+	// Lax (not Strict) is required: the OAuth callback from Cognito is a
+	// cross-site top-level redirect, which SameSite=Strict would block.
+	sessionMgr.Cookie.SameSite = http.SameSiteLaxMode
 	sessionMgr.Cookie.Secure = cfg.IsProduction
 
 	mux.Use(sessionMgr.LoadAndSave)
@@ -164,7 +166,7 @@ func (s *Service) setRoutes(mux *chi.Mux) {
 	// Auth routes — not protected by requireAuth.
 	mux.Method(http.MethodGet, "/login", s.handle(s.login))
 	mux.Method(http.MethodGet, "/auth/callback", s.handle(s.authCallback))
-	mux.Method(http.MethodGet, "/logout", s.handle(s.logout))
+	mux.Method(http.MethodPost, "/logout", s.handle(s.logout))
 
 	// JSON API routes — all require authentication; group-restricted routes
 	// use r.With(s.apiRequireGroup("group-name")) per endpoint.

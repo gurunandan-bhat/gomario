@@ -7,9 +7,28 @@ import (
 	"net/http"
 	"path/filepath"
 
+	"github.com/justinas/nosurf"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 )
+
+// templateData is the base data struct passed to every HTML template.
+// Page handlers call newTemplateData(r) and set Title plus any page-specific fields.
+type templateData struct {
+	Title           string
+	IsAuthenticated bool
+	CSRFToken       string
+	UserEmail       string
+}
+
+// newTemplateData populates base template fields from the current session and request.
+func (s *Service) newTemplateData(r *http.Request) templateData {
+	return templateData{
+		IsAuthenticated: s.SessionManager.GetBool(r.Context(), "isAuthenticated"),
+		CSRFToken:       nosurf.Token(r),
+		UserEmail:       s.SessionManager.GetString(r.Context(), "userEmail"),
+	}
+}
 
 func newTemplateCache(templateRoot string) (map[string]*template.Template, error) {
 

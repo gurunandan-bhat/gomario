@@ -11,7 +11,6 @@ import (
 	"golang.org/x/oauth2"
 )
 
-
 // cognitoOAuth2Config builds an oauth2.Config from the Cognito settings.
 func (s *Service) cognitoOAuth2Config() *oauth2.Config {
 	return &oauth2.Config{

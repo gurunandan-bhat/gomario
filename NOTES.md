@@ -85,9 +85,9 @@ Added `Cognito` struct to the config.
 Fetches and caches Cognito's JWKS on startup, then validates ID token JWTs (signature, expiry, issuer, audience) against the live keyset using `github.com/lestrrat-go/jwx/v3`.
 
 ### `lib/service/auth.go` *(new)*
-- `GET /login` — generates a random state, stores it in session, redirects to Cognito Hosted UI
-- `GET /auth/callback` — validates state, exchanges the code for tokens, validates the ID token, writes `isAuthenticated` / `userSub` / `userEmail` / `userGroups` to session, then redirects to the original URL
-- `GET /logout` — destroys the local session and redirects to Cognito's logout endpoint to clear the SSO session too
+- `GET /login` — generates a random state, stores it in session, redirects to Cognito Hosted UI via `oauth2.Config.AuthCodeURL`
+- `GET /auth/callback` — validates state, exchanges the code via `oauth2.Config.Exchange`, validates the ID token, writes `isAuthenticated` / `userSub` / `userEmail` / `userGroups` to session, then redirects to the original URL
+- `POST /logout` — destroys the local session and redirects to Cognito's logout endpoint to clear the SSO session; POST prevents logout CSRF
 
 ### `lib/service/middleware.go`
 - `requireAuth` now redirects to `/login` and checks only `isAuthenticated`
@@ -367,4 +367,74 @@ mux.Group(func(r chi.Router) {
 
 // Protect an HTML route with group membership:
 mux.With(s.requireGroup("admin")).Method(http.MethodGet, "/admin", s.handle(s.admin))
+```
+
+---
+
+# Auth Fixes and Improvements
+
+## Issues Found and Fixed
+
+### `SameSite=Strict` breaks the OAuth callback
+The session cookie was set with `SameSite=Strict`. When Cognito redirects back to `/auth/callback` after login, the browser treats it as a cross-site top-level redirect and does not send the session cookie. The callback handler receives a fresh empty session, `oauthState` is missing, and the state check fails with "invalid state parameter" even though the values match when logged.
+
+**Fix (`lib/service/service.go`):** Changed `http.SameSiteStrictMode` → `http.SameSiteLaxMode`. `Lax` still blocks cross-site POST requests and embedded resource loads, but allows the cookie to be sent on top-level GET redirects — which is exactly what the OAuth callback is.
+
+```go
+// Lax (not Strict) is required: the OAuth callback from Cognito is a
+// cross-site top-level redirect, which SameSite=Strict would block.
+sessionMgr.Cookie.SameSite = http.SameSiteLaxMode
+```
+
+### `logout_uri` misconfiguration causes a redirect loop
+`logout_uri` is the URL Cognito redirects the user *to* after clearing the SSO session — it is a destination, not the logout initiator. If set to the app's `/logout` path, Cognito redirects back to `/logout` after logout, which triggers another Cognito logout, causing an infinite loop.
+
+**Fix:** Set `logoutUrl` in `~/.gomario.json` to a landing page (e.g. `https://yourdomain.com/`), and register the same URL in Cognito's **Allowed sign-out URLs**. The two values must match exactly (scheme, host, path, trailing slash).
+
+### `GET /logout` is vulnerable to logout CSRF
+noSurf only protects unsafe HTTP methods (POST, PUT, DELETE). A `GET /logout` endpoint can be triggered by a malicious `<img src="/logout">` on any page, silently logging the user out.
+
+**Fix (`lib/service/service.go`):** Changed `/logout` route from `GET` to `POST`. The logout button in the nav is a small HTML form that includes the CSRF token; noSurf validates it automatically.
+
+### Manual token exchange replaced with `golang.org/x/oauth2`
+The original `exchangeCode` function manually built the HTTP POST, set the `Authorization` header, and decoded the JSON response. Replaced with `oauth2.Config.Exchange` from the standard `golang.org/x/oauth2` package, which handles all of this correctly and consistently.
+
+**Fix (`lib/service/auth.go`):** Added `cognitoOAuth2Config() *oauth2.Config` method. `login` uses `AuthCodeURL(state)` to build the redirect URL; `authCallback` uses `Exchange(ctx, code)` to obtain tokens. `id_token` is extracted via `tokens.Extra("id_token").(string)`.
+
+---
+
+## What Was Implemented — Template Data and Nav Auth State
+
+### `lib/service/render.go`
+Added `templateData` base struct and `newTemplateData(r)` helper:
+
+```go
+type templateData struct {
+    Title           string
+    IsAuthenticated bool
+    CSRFToken       string
+    UserEmail       string
+}
+```
+
+`newTemplateData(r)` reads `isAuthenticated` and `userEmail` from the session and the CSRF token from noSurf. Every page handler calls this instead of building ad-hoc data structs.
+
+### `lib/service/index.go`, `lib/service/start.go`
+Updated to use `s.newTemplateData(r)` and set `Title` on the returned struct. Removed the inline anonymous structs and the direct `nosurf` import from `start.go`.
+
+### `templates/common/top-menu.go.html`
+Nav now conditionally renders based on `IsAuthenticated`:
+- **Authenticated:** shows `UserEmail` and a `POST /logout` form with CSRF token
+- **Unauthenticated:** shows a "Sign in" link to `/login`
+- Fixed stale `/ai-start` link to `/start`
+
+### Usage pattern for new page handlers
+
+```go
+func (s *Service) myPage(w http.ResponseWriter, r *http.Request) error {
+    data := s.newTemplateData(r)
+    data.Title = "My Page"
+    // add page-specific fields by extending the struct
+    return s.render(w, "mypage.go.html", data, nil, http.StatusOK)
+}
 ```
