@@ -1,60 +1,29 @@
 package service
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 
 	"github.com/justinas/nosurf"
+	"golang.org/x/oauth2"
 )
 
-// tokenResponse is the JSON body returned by Cognito's /oauth2/token endpoint.
-type tokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	IDToken      string `json:"id_token"`
-	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int    `json:"expires_in"`
-	TokenType    string `json:"token_type"`
-}
 
-// exchangeCode exchanges an OAuth authorization code for tokens at Cognito's token endpoint.
-func (s *Service) exchangeCode(ctx context.Context, code string) (*tokenResponse, error) {
-	tokenURL := fmt.Sprintf("https://%s/oauth2/token", s.Config.Cognito.Domain)
-
-	body := url.Values{
-		"grant_type":   {"authorization_code"},
-		"client_id":    {s.Config.Cognito.ClientID},
-		"code":         {code},
-		"redirect_uri": {s.Config.Cognito.CallbackURL},
+// cognitoOAuth2Config builds an oauth2.Config from the Cognito settings.
+func (s *Service) cognitoOAuth2Config() *oauth2.Config {
+	return &oauth2.Config{
+		ClientID:     s.Config.Cognito.ClientID,
+		ClientSecret: s.Config.Cognito.ClientSecret,
+		RedirectURL:  s.Config.Cognito.CallbackURL,
+		Scopes:       []string{"openid", "email", "profile"},
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  fmt.Sprintf("https://%s/oauth2/authorize", s.Config.Cognito.Domain),
+			TokenURL: fmt.Sprintf("https://%s/oauth2/token", s.Config.Cognito.Domain),
+		},
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(body.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("exchangeCode: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.SetBasicAuth(s.Config.Cognito.ClientID, s.Config.Cognito.ClientSecret)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("exchangeCode: post: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("exchangeCode: token endpoint returned %d", resp.StatusCode)
-	}
-
-	var tr tokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-		return nil, fmt.Errorf("exchangeCode: decode response: %w", err)
-	}
-	return &tr, nil
 }
 
 // login redirects the user to the Cognito Hosted UI to begin the OAuth flow.
@@ -66,17 +35,9 @@ func (s *Service) login(w http.ResponseWriter, r *http.Request) error {
 	}
 	s.SessionManager.Put(r.Context(), "oauthState", state)
 
-	authURL := fmt.Sprintf("https://%s/oauth2/authorize?%s",
-		s.Config.Cognito.Domain,
-		url.Values{
-			"response_type": {"code"},
-			"client_id":     {s.Config.Cognito.ClientID},
-			"redirect_uri":  {s.Config.Cognito.CallbackURL},
-			"scope":         {"openid email profile"},
-			"state":         {state},
-		}.Encode(),
-	)
+	authURL := s.cognitoOAuth2Config().AuthCodeURL(state)
 
+	s.Logger.Info("Auth URL", "url", authURL)
 	http.Redirect(w, r, authURL, http.StatusFound)
 	return nil
 }
@@ -100,15 +61,20 @@ func (s *Service) authCallback(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	// Exchange the authorization code for tokens.
-	tokens, err := s.exchangeCode(r.Context(), code)
+	tokens, err := s.cognitoOAuth2Config().Exchange(r.Context(), code)
 	if err != nil {
 		return fmt.Errorf("authCallback: exchange code: %w", err)
+	}
+
+	idTokenStr, ok := tokens.Extra("id_token").(string)
+	if !ok || idTokenStr == "" {
+		return fmt.Errorf("authCallback: id_token missing from token response")
 	}
 
 	// Validate the ID token and extract claims.
 	idToken, err := s.JWKSCache.validateIDToken(
 		r.Context(),
-		tokens.IDToken,
+		idTokenStr,
 		s.Config.Cognito.ClientID,
 		s.Config.Cognito.Region,
 		s.Config.Cognito.UserPoolID,
