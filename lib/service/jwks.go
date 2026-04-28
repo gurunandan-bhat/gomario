@@ -63,3 +63,32 @@ func (jc *jwksCache) validateIDToken(ctx context.Context, rawToken string, clien
 
 	return token, nil
 }
+
+// validateAccessToken parses and validates a raw Cognito access token JWT.
+// Unlike ID tokens, Cognito access tokens carry client_id (not aud) and have
+// token_use == "access". Audience validation is intentionally omitted here.
+func (jc *jwksCache) validateAccessToken(ctx context.Context, rawToken string, region string, userPoolID string) (jwt.Token, error) {
+	keyset, err := jc.cache.Lookup(ctx, jc.keyURL)
+	if err != nil {
+		return nil, fmt.Errorf("jwks: lookup keyset: %w", err)
+	}
+
+	issuer := fmt.Sprintf("https://cognito-idp.%s.amazonaws.com/%s", region, userPoolID)
+
+	token, err := jwt.Parse(
+		[]byte(rawToken),
+		jwt.WithKeySet(keyset),
+		jwt.WithValidate(true),
+		jwt.WithIssuer(issuer),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("jwks: validate access token: %w", err)
+	}
+
+	var tokenUse string
+	if err := token.Get("token_use", &tokenUse); err != nil || tokenUse != "access" {
+		return nil, fmt.Errorf("jwks: expected access token, got %q", tokenUse)
+	}
+
+	return token, nil
+}

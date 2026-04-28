@@ -168,10 +168,10 @@ func (s *Service) setRoutes(mux *chi.Mux) {
 	mux.Method(http.MethodGet, "/auth/callback", s.handle(s.authCallback))
 	mux.Method(http.MethodPost, "/logout", s.handle(s.logout))
 
-	// JSON API routes — all require authentication; group-restricted routes
-	// use r.With(s.apiRequireGroup("group-name")) per endpoint.
+	// JSON API routes — authenticated via Bearer token from the Vue SPA.
+	// Group-restricted routes use r.With(s.apiBearerRequireGroup("group-name")).
 	mux.Route("/api", func(r chi.Router) {
-		r.Use(s.apiAuthMiddleware)
+		r.Use(s.apiBearerAuthMiddleware)
 
 		// Returns the current CSRF token so JavaScript can include it as
 		// X-CSRF-Token on state-mutating requests (POST/PUT/DELETE).
